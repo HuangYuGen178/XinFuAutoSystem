@@ -289,5 +289,78 @@ namespace AutoSystem.Services
                 }
             }
         }
+        /// <summary>
+        /// 通过 internal_label_code 查询 body_sn，若为 null 则返回 "NoCode"，否则返回实际值。
+        /// </summary>
+        public async Task<string> GetBodySnByInternalLabelAsync(string internalLabelCode)
+        {
+            if (string.IsNullOrWhiteSpace(internalLabelCode)) return "NoCode";
+            const string sql = @"SELECT body_sn FROM product_inspection_record WHERE internal_label_code = @internal_label_code LIMIT 1;";
+            using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connString))
+            {
+                await conn.OpenAsync().ConfigureAwait(false);
+                using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@internal_label_code", internalLabelCode);
+                    var o = await cmd.ExecuteScalarAsync().ConfigureAwait(false);
+                    if (o == null || o == DBNull.Value) return "NoCode";
+                    var bodySn = o.ToString();
+                    return string.IsNullOrWhiteSpace(bodySn) ? "NoCode" : bodySn;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 查询指定 internal_label_code 的七列，按 NG 组合输出唯一编号（全OK输出1）。
+        /// </summary>
+        public async Task<int> GetNgCombinationIndexAsync(string internalLabelCode)
+        {
+            if (string.IsNullOrWhiteSpace(internalLabelCode)) return 0;
+
+            const string sql = @"SELECT body_sn, buckle_result, top_cover_result, side1_result, side2_result, side3_result, side4_result
+                        FROM product_inspection_record
+                        WHERE internal_label_code = @internal_label_code
+                        LIMIT 1;";
+            using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connString))
+            {
+                await conn.OpenAsync().ConfigureAwait(false);
+                using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@internal_label_code", internalLabelCode);
+                    using (var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false))
+                    {
+                        if (!await reader.ReadAsync().ConfigureAwait(false)) return 0;
+                        // 依次判断每列是否为NG
+                        bool[] isNg = new bool[7];
+                        // body_sn: 只要不是"NG"或为空就算OK
+                        var bodySn = reader.IsDBNull(0) ? null : reader.GetString(0);
+                        //isNg[0] = string.IsNullOrWhiteSpace(bodySn) || bodySn.Trim().ToUpper() == "NG";
+                        isNg[0] = bodySn != null && bodySn.Trim().ToUpper() == "NG";
+                        // 其他列: 只要不是"OK"就算NG
+                        for (int i = 1; i < 7; i++)
+                        {
+                            var val = reader.IsDBNull(i) ? null : reader.GetString(i);
+                            isNg[i] = !"OK".Equals(val?.Trim(), StringComparison.OrdinalIgnoreCase);
+                        }
+
+                        // 全OK输出1
+                        if (isNg.All(x => !x)) return 1;
+
+                        // 计算编号（从2开始，二进制组合+1）
+                        int index = 0;
+                        for (int i = 0; i < 7; i++)
+                        {
+                            if (isNg[i])
+                                index |= (1 << i);
+                        }
+                        return index + 1; // 编号从2开始
+                    }
+                }
+            }
+        }
+
+
+
+
     }
 }

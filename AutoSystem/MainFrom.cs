@@ -20,6 +20,7 @@ namespace AutoSystem
         const int MaxLogItems = 1000;
         private readonly string iniPath;
         bool configOpenGuard = false; // 防重入标志
+        WriteLogNow writeTxtLog = new WriteLogNow("AutoSystem");
 
         public MainFrom()
         {
@@ -372,6 +373,7 @@ namespace AutoSystem
 
         private void LogToUi(string s)
         {
+            writeTxtLog.WriteLog(s);
             if (string.IsNullOrWhiteSpace(s)) return;
             try
             {

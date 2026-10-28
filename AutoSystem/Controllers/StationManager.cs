@@ -202,59 +202,49 @@ namespace AutoSystem.Controllers
                             try { var suffix = dm == 1 ? "需要读码" : "不需要读码"; OnStation1ReadBarcodeFlag?.Invoke($"读码标志：D50001 = {dm}{suffix}"); } catch { } //UI 实时显示读码标志
                             if (dm == 1)// 需要读码：等待 barcode1（只有在当前到位时所接收条码才有效）
                             {
-                                var tcs = new TaskCompletionSource<string>();
-                                barcodeTcs["S1"] = tcs;
-                                //Reader1Trigger(2);
-                                TriggerBarcodeSend(1); // 触发读码器1，触发字符串T
-                                var wait = await Task.WhenAny(tcs.Task, Task.Delay(8000, token));
                                 string code = null;
-                                var received = false;
-                                if (wait == tcs.Task)
+                                bool received = false;
+                                const int maxAttempts = 5;
+                                for (int attempt = 1; attempt <= maxAttempts && !token.IsCancellationRequested; attempt++)
                                 {
-                                    try { code = tcs.Task.Result; received = true; } catch { received = false; }
-                                }// 如果收到 NoRead 或者第一次超时 -> 再次触发一次
-                                if (!received || string.Equals(code, "NoRead", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    Log("站1: 首次读码 未收到有效条码或收到 NoRead，执行第二次触发。");
-                                    // 清理旧 tcs（如果还在字典中）
-                                    barcodeTcs.TryRemove("S1", out _);
-                                    var tcs2 = new TaskCompletionSource<string>();
-                                    barcodeTcs["S1"] = tcs2;
-                                    TriggerBarcodeSend(1); // 第二次触发
-                                    var wait2 = await Task.WhenAny(tcs2.Task, Task.Delay(8000, token));
-                                    if (wait2 == tcs2.Task)
+                                    var tcs = new TaskCompletionSource<string>();
+                                    barcodeTcs["S1"] = tcs;
+                                    //Reader1Trigger(2);
+                                    TriggerBarcodeSend(1); // 触发读码器1，触发字符串T
+                                    Log($"站1: 开始第 {attempt} 次触发读码。");
+                                    var wait = await Task.WhenAny(tcs.Task, Task.Delay(8000, token));
+                                    if (wait == tcs.Task)
                                     {
-                                        try { code = tcs2.Task.Result; received = true; } catch { received = false; }
+                                        try { code = tcs.Task.Result; received = true; } catch { received = false; }
                                     }
-                                    else { received = false; }// 无论成功或失败，都尝试移除 S1 的等待项
+                                    // 清理旧 tcs（如果还在字典中）确保移除字典中的等待项，避免残留
                                     barcodeTcs.TryRemove("S1", out _);
-
-                                    //// 第二次仍然超时或返回 NoRead -> 写 PLC 处理完成并跳过本次流程
-                                    //if (!received || string.Equals(code, "NoRead", StringComparison.OrdinalIgnoreCase))
-                                    //{
-                                    //    Log("站1: 第二次读码仍失败（超时或 NoRead），写入 D50003=2（处理NG），并继续等待下一个到位。");
-                                    //    try
-                                    //    {
-                                    //        await plc1.WriteintAsync("D50003", 2); // D50003 处理完成（告知 PLC 本次不继续等待）
-                                    //    }
-                                    //    catch (Exception ex) { Err("站1: 写入 D50003 失败: " + ex.Message); }
-                                    //    // 跳到下一循环，继续轮询到位信号
-                                    //    await Task.Delay(120, token);
-                                    //    continue;
-                                    //}
-                                    // 第二次仍然超时或返回 NoRead -> 将 code 设为 "NG" 
-                                    if (!received || string.Equals(code, "NoRead", StringComparison.OrdinalIgnoreCase))
+                                    // 如果收到 NoRead 或者超时 -> 再次触发一次
+                                    if (received && !string.Equals(code, "NoRead", StringComparison.OrdinalIgnoreCase))
                                     {
-                                        Log("站1: 第二次读码仍失败（超时或 NoRead），将条码赋值为 NG,续检测处理。");
+                                        Log($"站1: 第 {attempt} 次读码成功: {code}");
+                                        break; // 成功得到有效条码，跳出重试循环
+                                    }
+                                    // 若为 NoRead 或未收到，则决定是否继续重试
+                                    if (attempt < maxAttempts)
+                                    {
+                                        Log($"站1: 第 {attempt} 次读码未收到有效条码或收到 NoRead，准备进行第 {attempt + 1} 次触发。");
+                                        // 给读码器/系统一点时间再触发下一次
+                                        try { await Task.Delay(120, token); } catch (TaskCanceledException) { break; }
+                                        // 清除状态，继续下一次循环
+                                        received = false;
+                                        continue;
+                                    }
+                                    else
+                                    {
+                                        // 到达最大尝试次数仍未成功 -> 赋值为 "NG" 并继续后续检测逻辑
+                                        Log($"站1: 达到最大重试次数({maxAttempts})，仍未读到有效条码， 将条码赋值为 NG 并继续后续检测/记录。");
                                         code = "NG";
-                                        received = true;
+                                        received = true; // 标记为已“收到”，用于后续流程继续
+                                        break;
                                     }
                                 }
-                                else
-                                {
-                                    barcodeTcs.TryRemove("S1", out _); // 第一次成功，清理 S1（Barcode1Received 会 TryRemove，但确保无残留）
-                                }
-                                Log($"站1 收到条码: {code}。");//code 是有效的非 NoRead 条码
+                                Log($"站1 收到条码: {code}。");//code 是有效的非 NoRead 条码 或 "NG"
                                                          //await plc1.WriteStringAsync("D50010", code);// 写字符串到 PLC
                                                          //try { OnStation1CodeChanged?.Invoke($"D50010:{code}"); } catch { }// 通知 UI 更新 lblbarcode_1
                                 if (VisionFlag == 1) //需要检测卡扣
@@ -264,7 +254,7 @@ namespace AutoSystem.Controllers
                                     // 等视觉结果，最长 190s
                                     var vtcs = new TaskCompletionSource<VisionResult>();
                                     visionTcs[1] = vtcs;
-                                    BeginTrigger(1, "CAM1," + ModelNum + "\r\n");
+                                    BeginTrigger(1, "CAM1," + ModelNum + "," + code + "\r\n");
                                     var vdone = await Task.WhenAny(vtcs.Task, Task.Delay(190000, token));
                                     if (vdone == vtcs.Task)
                                     {
@@ -330,6 +320,7 @@ namespace AutoSystem.Controllers
                                         // 清除 D50003 以便 PLC 及流程恢复
                                         // await plc1.WriteintAsync("D50003", 0);
                                     }
+                                    visionTcs.TryRemove(1, out _);
                                 }
                                 else//不需要检测卡扣
                                 {// 更新界面状态
@@ -390,7 +381,7 @@ namespace AutoSystem.Controllers
                             {
                                 if (VisionFlag == 1)
                                 {
-                                    BeginTrigger(1, "CAM1," + ModelNum + "\r\n");
+                                    BeginTrigger(1, "CAM1," + ModelNum + ",NoCode" + "\r\n");
                                     Log("站1 配置为不需要读码：等待视觉结果并生成唯一 ID。");
                                     var vtcs = new TaskCompletionSource<VisionResult>();
                                     visionTcs[1] = vtcs;
@@ -661,12 +652,13 @@ namespace AutoSystem.Controllers
                         Log("站2 到位 (D50101=1)。读取产品 ID (D50110)。");
                         var idVal = await plc1.ReadStringAsync("D50110", 20);
                         Log("站2 读取到 D50110: " + idVal);
+                        string bodySn = await recorder.GetBodySnByInternalLabelAsync(idVal);
                         var ModelNum = await plc1.ReadintAsync("D50500");//机种号
                         Log("站2 读取到 50500 机种号: " + ModelNum);
                         try { OnStation2CodeChanged?.Invoke($"D50110:{idVal}"); } catch { }// 通知 UI 更新 lblbarcode_2
                         var vtcs = new TaskCompletionSource<VisionResult>();
                         visionTcs[2] = vtcs;
-                        BeginTrigger(1, "CAM2," + ModelNum + "\r\n");
+                        BeginTrigger(1, "CAM2," + ModelNum + "," + bodySn + "\r\n");
                         var vdone = await Task.WhenAny(vtcs.Task, Task.Delay(8000, token));
                         if (vdone == vtcs.Task)
                         {
@@ -727,17 +719,19 @@ namespace AutoSystem.Controllers
                         case 1: // 面1
                             var ModelNum = await plc1.ReadintAsync("D50500");//机种号
                             Log("站3 读取到 50500 机种号: " + ModelNum);
+                            var code = await plc1.ReadStringAsync("D50210", 20);
+                            Log("站3 面1 读取 D50210: " + code);
                             Log("站3 面1 到位 (D50201=1)，等待视觉 。");
+                            var bodySn = await recorder.GetBodySnByInternalLabelAsync(code);
                             var vtcs = new TaskCompletionSource<VisionResult>(); visionTcs[3] = vtcs;
-                            BeginTrigger(1, "CAM3A," + ModelNum + "\r\n");
+                            BeginTrigger(1, "CAM3A," + ModelNum + "," + bodySn + "\r\n");
                             var vdone = await Task.WhenAny(vtcs.Task, Task.Delay(8000, token));
                             if (vdone == vtcs.Task)
                             {
                                 var vr = vtcs.Task.Result;
                                 Log("站3 面1 视觉结果: " + vr);
                                 // 读取对应唯一码 D50210
-                                var code = await plc1.ReadStringAsync("D50210", 20);
-                                Log("站3 面1 读取 D50210: " + code);
+
                                 try { OnStation3CodeChanged?.Invoke($"D50205:{code}"); } catch { }// 通知 UI 更新 lblbarcode_3A (D50210)
                                 try
                                 {
@@ -770,16 +764,18 @@ namespace AutoSystem.Controllers
                     {
                         var ModelNum = await plc1.ReadintAsync("D50500");//机种号
                         Log("站3 读取到 50500 机种号: " + ModelNum);
+                        var code = await plc1.ReadStringAsync("D50210", 20);
+                        Log("站3 面2 读取条码 D50210: " + code);
                         Log("站3 面2 到位 (D50201=2)，等待视觉。");
+                        var bodySn = await recorder.GetBodySnByInternalLabelAsync(code);
                         var vtcs = new TaskCompletionSource<VisionResult>(); visionTcs[4] = vtcs;
-                        BeginTrigger(1, "CAM3B," + ModelNum + "\r\n");
+                        BeginTrigger(1, "CAM3B," + ModelNum + "," + bodySn + "\r\n");
                         var vdone = await Task.WhenAny(vtcs.Task, Task.Delay(8000, token));
                         if (vdone == vtcs.Task)
                         {
                             var vr = vtcs.Task.Result;
                             Log("站3 面2 视觉结果: " + vr);
-                            var code = await plc1.ReadStringAsync("D50210", 20);
-                            Log("站3 面2 读取条码 D50210: " + code);
+
                             try { OnStation3CodeChanged?.Invoke($"D50210:{code}"); } catch { }// 通知 UI 更新 lblbarcode_3A (D50210)
                             try
                             {
@@ -806,16 +802,18 @@ namespace AutoSystem.Controllers
                     {
                         var ModelNum = await plc1.ReadintAsync("D50500");//机种号
                         Log("站3 读取到 50500 机种号: " + ModelNum);
+                        var code = await plc1.ReadStringAsync("D50210", 20);
+                        Log("站3 面3 读取条码 D50210: " + code);
+                        var bodySn = await recorder.GetBodySnByInternalLabelAsync(code);
                         Log("站3 面3 到位 (D50201=3)，等待视觉 index=5。");
                         var vtcs = new TaskCompletionSource<VisionResult>(); visionTcs[5] = vtcs;
-                        BeginTrigger(1, "CAM3C," + ModelNum + "\r\n");
+                        BeginTrigger(1, "CAM3C," + ModelNum + "," + bodySn + "\r\n");
                         var vdone = await Task.WhenAny(vtcs.Task, Task.Delay(8000, token));
                         if (vdone == vtcs.Task)
                         {
                             var vr = vtcs.Task.Result;
                             Log("站3 面3 视觉结果: " + vr);
-                            var code = await plc1.ReadStringAsync("D50210", 20);
-                            Log("站3 面3 读取条码 D50210: " + code);
+
                             try { OnStation3CodeChanged?.Invoke($"D50210:{code}"); } catch { }// 通知 UI 更新 lblbarcode_3A (D50210)
                             try
                             {
@@ -842,16 +840,18 @@ namespace AutoSystem.Controllers
                     {
                         var ModelNum = await plc1.ReadintAsync("D50500");//机种号
                         Log("站3 读取到 50500 机种号: " + ModelNum);
+                        var code = await plc1.ReadStringAsync("D50210", 20);
+                        Log("站3 面4 读取条码 D50210: " + code);
+                        var bodySn = await recorder.GetBodySnByInternalLabelAsync(code);
                         Log("站3 面4 到位 (D50201=4)，等待视觉 index=6。");
                         var vtcs = new TaskCompletionSource<VisionResult>(); visionTcs[6] = vtcs;
-                        BeginTrigger(1, "CAM3D," + ModelNum + "\r\n");
+                        BeginTrigger(1, "CAM3D," + ModelNum + "," + bodySn + "\r\n");
                         var vdone = await Task.WhenAny(vtcs.Task, Task.Delay(8000, token));
                         if (vdone == vtcs.Task)
                         {
                             var vr = vtcs.Task.Result;
                             Log("站3 面4 视觉结果: " + vr);
-                            var code = await plc1.ReadStringAsync("D50210", 20);
-                            Log("站3 面4 读取条码 D50210: " + code);
+
                             try { OnStation3CodeChanged?.Invoke($"D50210:{code}"); } catch { }// 通知 UI 更新 lblbarcode_3A (D50210)
                             try
                             {
@@ -867,6 +867,8 @@ namespace AutoSystem.Controllers
                                     int val = string.Equals(total, "OK", StringComparison.OrdinalIgnoreCase) ? 1 : 2;
                                     try
                                     {
+                                        if (val != 1) val = await recorder.GetNgCombinationIndexAsync(code);
+                                        if (val == 0) Log($"站3: 未匹配到对应的 internal={code} -> {val}。");
                                         await plc1.WriteintAsync("D50206", val); // 写入四面总结果到 PLC（1=OK,2=NG）
                                         Log($"站3: 查询到 total_result={total}，已写 D50206={val}。");
                                         Log($"站3: 汇总结果 internal={code} -> {val}，已写入 D50206。");
@@ -953,12 +955,11 @@ namespace AutoSystem.Controllers
                         }
                         catch { }
                         Log($"PLC2 内配置 D50302={Stn4ALabFlag}, D50303={Stn4APackNum}, D50304={Stn4AReadcodeFlag}");
-
-                        if (Stn4ALabFlag == 1) // 需要贴标
+                        if (Stn4APackNum == 1) // 包1层 -> barcode2 -> 打印机1
                         {
                             if (Stn4AReadcodeFlag == 1) // 需要读码//需要读码时是通过PLC内寄存的箱体条码去数据库查询内部流水标签码
                             {
-                                if (Stn4APackNum == 1) // 包1层 -> barcode2 -> 打印机1  
+                                if (Stn4ALabFlag == 1) // 包1层，需读码，需贴标
                                 {
                                     Log("PLC2: 包1层且需读码，等待读码器2 (barcode2) 的条码，打印到打印机1。");
                                     var tcs = new TaskCompletionSource<string>(); barcodeTcs["PLC2_BC"] = tcs;
@@ -1013,7 +1014,63 @@ namespace AutoSystem.Controllers
                                     else Log("PLC2 等待 barcode2 超时。");
                                     barcodeTcs.TryRemove("PLC2_BC", out _);
                                 }
-                                else if (Stn4APackNum == 2) // 包2层 -> barcode2 -> 打印机2
+                                else
+                                {
+                                    Log("PLC2: 包1层，需读码，但不贴标，跳过打印处理。");
+                                }
+                            }
+                            else
+                            {
+                                if (Stn4ALabFlag == 1)// 包1层，不需读码，需贴标
+                                {
+                                    Log("PLC2: 包1层，不需读码，读取 D50310 并打印到打印机1。");
+                                    var code = await plc2.ReadStringAsync("D50310", 40);
+                                    Log("PLC2 读取 D50310: " + code);
+                                    try { OnStation4ACodeChanged?.Invoke($"D50310:{code}"); } catch { }
+                                    bool bol = await recorder?.ExistsByInternalAsync(code);
+                                    if (bol)
+                                    {
+                                        string printLabel = UniqueIdGenerator.GetPrintLabelCode(code);
+                                        string[] strName = new string[] { "Var0" };//string[] strName = new string[] { "张三", "李四", "王五" };
+                                        string[] strValue = new string[] { printLabel };
+                                        PrintResult result;
+                                        //  PLC条码即内部流水标签码
+                                        UniqueIdGenerator.ParseInternalLabel(code, out string vendor, out int seq, out string date);
+                                        try { OnStation4ACodeChanged?.Invoke($"条码:{code}"); } catch { }// 通知 UI 更新
+                                        result = printer1.Print(GetPrinterNameFor(1), Path.Combine(Application.StartupPath, "LAB1.lab"), 1, strName, strValue);   // 执行打印
+                                        ini.SetValue("APP", "PRINTER1_LastID", printLabel);
+                                        if (result.IsSuccess)
+                                        {
+                                            Log("PLC2: 已发送资料到打印机 print_label_code (internal=" + printLabel + ").");//SendToPrinter(GetPrinterNameFor(1), seq + date);
+                                            try
+                                            {
+                                                await recorder?.UpdatePrintLabelAsync(code);
+                                                await plc2.WriteintAsync("D50305", 1); // D50003 处理完成
+                                                Log("PLC2站4: 读码器读码完成，写入 D50305=1。");
+                                            }
+                                            catch (Exception ex) { Err("PLC2: 更新数据库失败: " + ex.Message); }
+                                        }
+                                        else
+                                        {
+                                            Log("ERROR,Labeling machine station printing failed, please check the log to see the reason");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Log("PLC2 未查询到该流水码 " + code);
+                                    }
+                                }
+                                else
+                                {
+                                    Log("PLC2: 包1层，不需读码，也不贴标，跳过打印处理。");
+                                }
+                            }
+                        }
+                        else if (Stn4APackNum == 2) // 包2层 -> barcode2 -> 打印机2
+                        {
+                            if (Stn4AReadcodeFlag == 1)
+                            {
+                                if (Stn4ALabFlag == 1) // 包2层，需读码，需贴标
                                 {
                                     Log("PLC2: 包2层且需读码，等待读码器2 (barcode2)，用于打印机2。");
                                     var tcs = new TaskCompletionSource<string>(); barcodeTcs["PLC2_BC"] = tcs;
@@ -1066,59 +1123,61 @@ namespace AutoSystem.Controllers
                                     else Log("PLC2 等待 barcode2 超时。");
                                     barcodeTcs.TryRemove("PLC2_BC", out _);
                                 }
+                                else
+                                {
+                                    Log("PLC2: 包2层，需读码，但不贴标，跳过打印处理。");
+                                }
                             }
                             else // 不需要读码，读取 D50310 并发送到打印机1（无论包1/包2，按需求写）
                             {
-                                Log("PLC2: 需要贴标但不需读码，读取 D50310 并打印（Codesoft 模板）。");
-                                var code = await plc2.ReadStringAsync("D50310", 40);
-                                Log("PLC2 读取 D50310: " + code);
-                                try { OnStation4ACodeChanged?.Invoke($"D50310:{code}"); } catch { } // 通知 UI 更新 lblbarcode_4A
-                                bool bol = await recorder?.ExistsByInternalAsync(code);
-                                if (bol)
+                                if (Stn4ALabFlag == 1)// 包2层，不需读码，需贴标
                                 {
-                                    string printLabel = UniqueIdGenerator.GetPrintLabelCode(code);
-                                    string[] strName = new string[] { "Var0" };//string[] strName = new string[] { "张三", "李四", "王五" };
-                                    string[] strValue = new string[] { printLabel };
-                                    PrintResult result;
-                                    //  PLC条码即内部流水标签码
-                                    UniqueIdGenerator.ParseInternalLabel(code, out string vendor, out int seq, out string date);
-                                    if (Stn4APackNum == 1)//包1层发送资料到打印机1
+                                    Log("PLC2: 包2层需要贴标但不需读码，读取 D50310 并打印（Codesoft 模板）。");
+                                    var code = await plc2.ReadStringAsync("D50310", 40);
+                                    Log("PLC2 读取 D50310: " + code);
+                                    try { OnStation4ACodeChanged?.Invoke($"D50310:{code}"); } catch { } // 通知 UI 更新 lblbarcode_4A
+                                    bool bol = await recorder?.ExistsByInternalAsync(code);
+                                    if (bol)
                                     {
+                                        string printLabel = UniqueIdGenerator.GetPrintLabelCode(code);
+                                        string[] strName = new string[] { "Var0" };//string[] strName = new string[] { "张三", "李四", "王五" };
+                                        string[] strValue = new string[] { printLabel };
+                                        PrintResult result;
+                                        //  PLC条码即内部流水标签码
+                                        UniqueIdGenerator.ParseInternalLabel(code, out string vendor, out int seq, out string date);
                                         try { OnStation4ACodeChanged?.Invoke($"条码:{code}"); } catch { }// 通知 UI 更新
-                                        result = printer1.Print(GetPrinterNameFor(1), Path.Combine(Application.StartupPath, "LAB1.lab"), 1, strName, strValue);   // 执行打印
-                                        ini.SetValue("APP", "PRINTER1_LastID", printLabel);
-                                    }
-                                    else//包2层发送资料到打印机2
-                                    {
-                                        try { OnStation4BCodeChanged?.Invoke($"条码:{code}"); } catch { }// 通知 UI 更新
                                         result = printer1.Print(GetPrinterNameFor(2), Path.Combine(Application.StartupPath, "LAB1.lab"), 1, strName, strValue);   // 执行打印
                                         ini.SetValue("APP", "PRINTER2_LastID", printLabel);
-                                    }
-                                    if (result.IsSuccess)
-                                    {
-                                        Log("PLC2: 已发送资料到打印机 print_label_code (internal=" + printLabel + ").");//SendToPrinter(GetPrinterNameFor(1), seq + date);
-                                        try
+                                        if (result.IsSuccess)
                                         {
-                                            await recorder?.UpdatePrintLabelAsync(code);
-                                            await plc2.WriteintAsync("D50305", 1); // D50003 处理完成
-                                            Log("PLC2站4: 读码器读码完成，写入 D50305=1。");
+                                            Log("PLC2: 已发送资料到打印机 print_label_code (internal=" + printLabel + ").");//SendToPrinter(GetPrinterNameFor(1), seq + date);
+                                            try
+                                            {
+                                                await recorder?.UpdatePrintLabelAsync(code);
+                                                await plc2.WriteintAsync("D50305", 1); // D50003 处理完成
+                                                Log("PLC2站4: 读码器读码完成，写入 D50305=1。");
+                                            }
+                                            catch (Exception ex) { Err("PLC2: 更新数据库失败: " + ex.Message); }
                                         }
-                                        catch (Exception ex) { Err("PLC2: 更新数据库失败: " + ex.Message); }
+                                        else
+                                        {
+                                            Log("ERROR,Labeling machine station printing failed, please check the log to see the reason");
+                                        }
                                     }
                                     else
                                     {
-                                        Log("ERROR,Labeling machine station printing failed, please check the log to see the reason");
+                                        Log("PLC2 未查询到该流水码 " + code);
                                     }
                                 }
                                 else
                                 {
-                                    Log("PLC2 未查询到该流水码 " + code);
+                                    Log("PLC2: 包2层，不需读码，也不贴标，跳过打印处理。");
                                 }
                             }
                         }
                         else
                         {
-                            Log("PLC2: 配置为不贴标 (D50302=2)，跳过打印处理。");
+                            Log("PLC2: 未知包装层数，跳过处理。");
                         }
                     }
 
@@ -1140,14 +1199,15 @@ namespace AutoSystem.Controllers
                         catch { }
                         Log($"PLC3 配置 D50402={Stn4BLabFlag}, D50403={Stn4BReadcodeFlag}, D50404={Stn4BReadcodeFlag}");
 
-                        if (Stn4BLabFlag == 1) // 需要贴标
+                        if (Stn4BPackNum == 1) // 包1层 
                         {
                             if (Stn4BReadcodeFlag == 1) // 需要读码
                             {
-                                if (Stn4BPackNum == 1) // 包1层 -> barcode3 -> 打印机2
+                                if (Stn4BLabFlag == 1) // 包1层，需读码，需贴标 -> barcode3 -> 打印机2
                                 {
                                     Log("PLC3: 包1层且需读码，等待读码器3 (barcode3)，打印到打印机2。");
                                     var tcs = new TaskCompletionSource<string>(); barcodeTcs["PLC3_BC"] = tcs;
+                                    TriggerBarcodeSend(3);
                                     var done = await Task.WhenAny(tcs.Task, Task.Delay(8000, token));
                                     if (done == tcs.Task)
                                     {
@@ -1194,12 +1254,12 @@ namespace AutoSystem.Controllers
                                 }
                                 else
                                 {
-                                    Log("PLC3 包装层数为2或不处理，跳过读码打印。");
+                                    Log("PLC3: 包1层，需读码，但不贴标，跳过打印处理。");
                                 }
                             }
                             else // 不需要读码，读取 D50410 并打印到打印机2（当 D52==1）
                             {
-                                if (Stn4BPackNum == 1)
+                                if (Stn4BLabFlag == 1)// 包1层，不需读码，需贴标
                                 {
                                     Log("PLC3: 需要贴标但不需读码，读取 D50410 并打印到打印机2。");
                                     var code = await plc3.ReadStringAsync("D50410", 40);
@@ -1218,33 +1278,135 @@ namespace AutoSystem.Controllers
                                         {
                                             ini.SetValue("APP", "PRINTER2_LastID", printLabel);
                                             Log("PLC2: 已发送资料到打印机 print_label_code (internal=" + code + ").");
+                                            try
+                                            {
+                                                await recorder?.UpdatePrintLabelAsync(code);
+                                                await plc3.WriteintAsync("D50405", 1); // D50405 处理完成
+                                                Log("PLC2站4: 读码器读码完成，写入 D50405=1。");
+                                            }
+                                            catch (Exception ex) { Err("PLC3: 更新数据库失败: " + ex.Message); }
                                         }
                                         else { Log("ERROR,Labeling machine station printing failed, please check the log to see the reason"); }
                                         // SendToPrinter(GetPrinterNameFor(2), seq + date);
-                                        try
-                                        {
-                                            await recorder?.UpdatePrintLabelAsync(code);
-                                            await plc3.WriteintAsync("D50405", 1); // D50405 处理完成
-                                            Log("PLC2站4: 读码器读码完成，写入 D50405=1。");
-                                        }
-                                        catch (Exception ex) { Err("PLC3: 更新数据库失败: " + ex.Message); }
                                     }
                                     else
                                     {
                                         Log("PLC3 未查询到该流水码 " + code);
                                     }
                                 }
-                                else Log("PLC3 包装层数为2，无需处理。");
+                                else
+                                {
+                                    Log("PLC3: 包1层，不需读码，也不贴标，跳过打印处理。");
+                                }
+                            }
+                        }
+                        else if (Stn4BPackNum == 2)
+                        {
+                            if (Stn4BReadcodeFlag == 1)
+                            {
+                                if (Stn4BLabFlag == 1)// 包2层，需读码，需贴标
+                                {
+                                    Log("PLC3: 包2层且需读码，等待读码器3 (barcode3)，打印到打印机2。");
+                                    var tcs = new TaskCompletionSource<string>(); barcodeTcs["PLC3_BC"] = tcs;
+                                    TriggerBarcodeSend(3);
+                                    var done = await Task.WhenAny(tcs.Task, Task.Delay(8000, token));
+                                    if (done == tcs.Task)
+                                    {
+                                        var code = tcs.Task.Result;
+                                        Log("PLC3 收到 barcode3: " + code);
+                                        var vendor = vendorProvider?.Invoke() ?? "DEFAULT";
+                                        var selectedDate = dateProvider?.Invoke() ?? DateTime.Now.Date;
+                                        string internalLabel = null;
+                                        try
+                                        {
+                                            internalLabel = await recorder?.FindInternalByBodyAsync(code, vendor, selectedDate);
+                                            try { OnStation4BCodeChanged?.Invoke($"barcode3:{internalLabel}"); } catch { }
+                                            string cover_sn = "";
+                                            try { await recorder?.Updatecover_snAsync(internalLabel, cover_sn); } catch { }
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Err("PLC3: 查询内部流水标签时发生错误: " + ex.Message);
+                                        }
+                                        Log("PLC3: 找到匹配的 internal_label_code: " + internalLabel);
+                                        string printLabel = UniqueIdGenerator.GetPrintLabelCode(internalLabel);
+                                        string[] strName = new string[] { "Var0" };
+                                        string[] strValue = new string[] { printLabel };
+                                        var result = printer1.Print(GetPrinterNameFor(2), Path.Combine(Application.StartupPath, "LAB1.lab"), 1, strName, strValue);
+                                        if (result.IsSuccess)
+                                        {
+                                            ini.SetValue("APP", "PRINTER2_LastID", printLabel);
+                                            Log("PLC3: 已发送资料到打印机 print_label_code (internal=" + internalLabel + ").");
+                                        }
+                                        else { Log("ERROR,Labeling machine station printing failed, please check the log to see the reason"); }
+                                        try
+                                        {
+                                            await recorder?.UpdatePrintLabelAsync(code);
+                                            await plc3.WriteintAsync("D50405", 1);
+                                            Log("PLC3站4: 读码器读码完成，写入 D50405=1。");
+                                        }
+                                        catch (Exception ex) { Err("PLC3: 更新数据库失败: " + ex.Message); }
+                                    }
+                                    else Log("PLC3 等待 barcode3 超时。");
+                                    barcodeTcs.TryRemove("PLC3_BC", out _);
+                                }
+                                else
+                                {
+                                    Log("PLC3: 包2层，需读码，但不贴标，跳过打印处理。");
+                                }
+                            }
+                            else
+                            {
+                                if (Stn4BLabFlag == 1)
+                                {
+                                    // 包2层，不需读码，需贴标
+                                    Log("PLC3: 包2层，不需读码，读取 D50410 并打印到打印机2。");
+                                    var code = await plc3.ReadStringAsync("D50410", 40);
+                                    Log("PLC3 读取 D50410: " + code);
+                                    try { OnStation4BCodeChanged?.Invoke($"D50410:{code}"); } catch { }
+                                    bool bol = await recorder?.ExistsByInternalAsync(code);
+                                    if (bol)
+                                    {
+                                        UniqueIdGenerator.ParseInternalLabel(code, out string vendor, out int seq, out string date);
+                                        string printLabel = UniqueIdGenerator.GetPrintLabelCode(code);
+                                        string[] strName = new string[] { "Var0" };
+                                        string[] strValue = new string[] { printLabel };
+                                        var result = printer1.Print(GetPrinterNameFor(2), Path.Combine(Application.StartupPath, "LAB1.lab"), 1, strName, strValue);
+                                        ini.SetValue("APP", "PRINTER2_LastID", printLabel);
+                                        if (result.IsSuccess)
+                                        {
+                                            Log("PLC3: 已发送资料到打印机 print_label_code (internal=" + code + ").");
+                                            try
+                                            {
+                                                await recorder?.UpdatePrintLabelAsync(code);
+                                                await plc3.WriteintAsync("D50405", 1);
+                                                Log("PLC3站4: 读码器读码完成，写入 D50405=1。");
+                                            }
+                                            catch (Exception ex) { Err("PLC3: 更新数据库失败: " + ex.Message); }
+                                        }
+                                        else
+                                        {
+                                            Log("ERROR,Labeling machine station printing failed, please check the log to see the reason");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Log("PLC3 未查询到该流水码 " + code);
+                                    }
+                                }
+                                else
+                                {
+                                    Log("PLC3: 包2层，不需读码，也不贴标，跳过打印处理。");
+                                }
                             }
                         }
                         else
                         {
-                            Log("PLC3: 配置为不贴标 (D50402=2)，跳过打印处理。");
+                            Log("PLC3: 未知包装层数，跳过处理。");
                         }
                     }
                 }
                 catch (Exception ex) { Err("站4 异常: " + ex.Message); }
-
                 await Task.Delay(150, token);
             }
         }
@@ -1257,7 +1419,7 @@ namespace AutoSystem.Controllers
                 try
                 {
                     var Stn4ARePrintSignal = await plc2.ReadintAsync("D60101");
-                   // Log($"到位信号：D60101={Stn4ARePrintSignal}");
+                    // Log($"到位信号：D60101={Stn4ARePrintSignal}");
                     if (Stn4ARePrintSignal == 1)
                     {
                         Log("1号列印站 到位 (D60101=1)。读取产品 ID (D60110)。");

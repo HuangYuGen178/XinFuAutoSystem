@@ -89,6 +89,7 @@
     <Compile Include="Services\PlcMelsecClient.cs" />
     <Compile Include="Services\TcpDeviceClient.cs" />
     <Compile Include="Services\UniqueIdGenerator.cs" />
+    <Compile Include="Services\WriteLogNow.cs" />
     <EmbeddedResource Include="ConfigForm.resx">
       <DependentUpon>ConfigForm.cs</DependentUpon>
     </EmbeddedResource>
